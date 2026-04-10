@@ -463,11 +463,15 @@ const EMP_NAMES = {
 
 
 // ── CONTRATOS (planilha separada) ──
-const CONTRACTS_SHEETS_ID = "192OfD0S-ygrediKMEpTpmSr70Rm4pW4vkfBhnCKRrJg";
-const CONTRACTS_GID = "933560972";
+// Contratos e NN: abas da planilha principal
+const CONTRACTS_TAB = "medições";
+const NN_TAB = "ACOMPANHAMENTO NN";
 
 function _contractsGvizUrl(){
-  return `https://docs.google.com/spreadsheets/d/${CONTRACTS_SHEETS_ID}/gviz/tq?tqx=out:json&gid=${CONTRACTS_GID}`;
+  return `https://docs.google.com/spreadsheets/d/${SHEETS_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(CONTRACTS_TAB)}`;
+}
+function _nnGvizUrl(){
+  return `https://docs.google.com/spreadsheets/d/${SHEETS_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(NN_TAB)}`;
 }
 
 // Parse numeric cell values. Prefer raw .v (already a Number); fall back to .f
@@ -591,6 +595,84 @@ async function fetchContractsSheet(){
   return _parseGviz(text);
 }
 
+// ── ACOMPANHAMENTO NN parser ──
+// Expected fields: emp (empreendimento), mun (município), uf, visita (SIM/NÃO),
+// periodo (data da visita), v1 (1ª versão relatório), vult (versão atual), obs.
+function parseNNSheet(gviz){
+  const rows = gviz.table.rows || [];
+  const cols = gviz.table.cols || [];
+
+  const norm = (s)=>(s||"").toString().toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .replace(/[^a-z0-9]/g,"");
+
+  const synonyms = {
+    emp:     ["empreendimento","emp","nome","denominacao","terreno"],
+    mun:     ["municipio","mun","cidade"],
+    uf:     ["uf","estado"],
+    visita: ["visita","visitado","visitada"],
+    periodo:["periodo","datavisita","dtvisita","datadavisita","data"],
+    v1:     ["v1","1versao","primeiraversao","relatorio1","r1","v01","versao1"],
+    vult:   ["vult","versaoatual","ultversao","ultimaversao","versaoult","atual","relatorioatual"],
+    obs:    ["obs","observacao","observacoes","notas"]
+  };
+
+  // Detect column indices from headers
+  let idxMap = {};
+  cols.forEach((c,i)=>{
+    const label = norm(c.label);
+    if(!label) return;
+    for(const key in synonyms){
+      if(idxMap[key] != null) continue;
+      if(synonyms[key].some(s => label === s || label.includes(s))){
+        idxMap[key] = i;
+        break;
+      }
+    }
+  });
+
+  // Fallback to fixed positions if header detection failed
+  if(Object.keys(idxMap).length < 4){
+    idxMap = {emp:0, mun:1, uf:2, visita:3, periodo:4, v1:5, vult:6, obs:7};
+  }
+
+  const out = [];
+  rows.forEach(r=>{
+    const cells = r.c || [];
+    const str = (k)=>{
+      const ci = idxMap[k];
+      if(ci == null) return "";
+      const c = cells[ci];
+      if(!c) return "";
+      const v = (c.f != null ? c.f : c.v);
+      return (v==null) ? "" : String(v).trim();
+    };
+    const emp = str("emp");
+    if(!emp) return;
+    if(emp.toUpperCase().includes("EMPREENDIMENTO") || emp.toUpperCase().includes("ACOMPANHAMENTO")) return;
+
+    out.push({
+      emp:     emp,
+      mun:     str("mun"),
+      uf:      str("uf").toUpperCase(),
+      visita:  str("visita").toUpperCase(),
+      periodo: str("periodo"),
+      v1:      str("v1"),
+      vult:    str("vult"),
+      obs:     str("obs")
+    });
+  });
+  return out;
+}
+
+async function fetchNNSheet(){
+  const url = _nnGvizUrl();
+  const resp = await fetch(url, {cache:"no-store"});
+  if(!resp.ok) throw new Error(`HTTP ${resp.status} ao buscar aba "${NN_TAB}"`);
+  const text = await resp.text();
+  return _parseGviz(text);
+}
+
 const CACHE_KEY = "conviver_sheets_cache_v1";
 const CACHE_TTL = 5*60*1000; // 5 minutes
 
@@ -710,7 +792,7 @@ async function loadFromSheets(forceRefresh){
       if(raw){
         const cached = JSON.parse(raw);
         if(cached && (Date.now()-cached.ts) < CACHE_TTL){
-          return {data:cached.data, contracts:(cached.contracts||null), fromCache:true, ts:cached.ts};
+          return {data:cached.data, contracts:(cached.contracts||null), nn:(cached.nn||null), fromCache:true, ts:cached.ts};
         }
       }
     } catch(e){}
@@ -724,15 +806,18 @@ async function loadFromSheets(forceRefresh){
   const dvtGviz = await fetchSheet(SHEETS_TABS.DVT);
   newD.DVT = parseDVTSheet(dvtGviz);
 
-  // Fetch contracts from separate spreadsheet
+  // Fetch contracts and NN from same spreadsheet, different tabs
   const contractsGviz = await fetchContractsSheet();
   const newContracts = parseContractsSheet(contractsGviz);
 
+  const nnGviz = await fetchNNSheet();
+  const newNN = parseNNSheet(nnGviz);
+
   // Save cache
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({ts:Date.now(), data:newD, contracts:newContracts}));
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ts:Date.now(), data:newD, contracts:newContracts, nn:newNN}));
   } catch(e){}
-  return {data:newD, contracts:newContracts, fromCache:false, ts:Date.now()};
+  return {data:newD, contracts:newContracts, nn:newNN, fromCache:false, ts:Date.now()};
 }
 
 function showLoadingOverlay(msg){
@@ -779,6 +864,10 @@ async function reloadAllFromSheets(forceRefresh){
     if(result.contracts){
       CONTRATOS.length = 0;
       result.contracts.forEach(c=>CONTRATOS.push(c));
+    }
+    if(result.nn){
+      NN_DATA.length = 0;
+      result.nn.forEach(n=>NN_DATA.push(n));
     }
     // Re-render everything
     buildDash();
@@ -2392,27 +2481,7 @@ document.addEventListener('keydown',e=>{
 });
 
 // ── NN DATA ──
-const NN_DATA = [
-  {emp:'SEM DENOMINAÇÃO', mun:'RAPOSA', uf:'MA', visita:'NÃO', periodo:'', v1:'24/03/2026', vult:'24/03/2026', obs:''},
-  {emp:'SEM DENOMINAÇÃO', mun:'PAÇO DO LUMIAR', uf:'MA', visita:'NÃO', periodo:'', v1:'24/03/2026', vult:'24/03/2026', obs:''},
-  {emp:'SEM DENOMINAÇÃO', mun:'PATOS', uf:'PB', visita:'SIM', periodo:'09/02/2026', v1:'04/04/2026', vult:'04/04/2026', obs:''},
-  {emp:'SEM DENOMINAÇÃO', mun:'PICOS', uf:'PI', visita:'SIM', periodo:'30/07/2025', v1:'25/07/2025', vult:'01/10/2025', obs:''},
-  {emp:'SEM DENOMINAÇÃO', mun:'IGUATU', uf:'CE', visita:'SIM', periodo:'11/12/2025', v1:'10/11/2025', vult:'30/01/2026', obs:''},
-  {emp:'TERRENO 4HA', mun:'BARREIRINHAS', uf:'MA', visita:'SIM', periodo:'03/12/2025', v1:'15/12/2025', vult:'16/01/2026', obs:''},
-  {emp:'BARREIRINHAS 2', mun:'BARREIRINHAS', uf:'MA', visita:'SIM', periodo:'03/12/2025', v1:'10/12/2025', vult:'10/12/2025', obs:''},
-  {emp:'SEM DENOMINAÇÃO', mun:'VIÇOSA', uf:'CE', visita:'SIM', periodo:'03/07/2025', v1:'25/07/2025', vult:'25/07/2025', obs:''},
-  {emp:'TIANGUA II', mun:'TIANGUÁ', uf:'CE', visita:'NÃO', periodo:'', v1:'28/11/2025', vult:'28/11/2025', obs:''},
-  {emp:'ANDRE BAHIA', mun:'PARNAÍBA', uf:'PI', visita:'SIM', periodo:'01/07/2025', v1:'02/10/2025', vult:'02/10/2025', obs:''},
-  {emp:'JANE BRODER', mun:'PARNAÍBA', uf:'PI', visita:'SIM', periodo:'01/07/2025', v1:'29/09/2025', vult:'29/09/2025', obs:''},
-  {emp:'BR LIFE', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'11/02/2026', v1:'02/03/2026', vult:'02/03/2026', obs:''},
-  {emp:'CIDADE CONVIVER', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'20/11/2025', vult:'20/11/2025', obs:''},
-  {emp:'BILL', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'', vult:'', obs:'EM ELABORAÇÃO'},
-  {emp:'COPERLINE', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'27/10/2025', vult:'27/10/2025', obs:''},
-  {emp:'ZE DANTAS', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'13/10/2025', vult:'13/10/2025', obs:''},
-  {emp:'NERE', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'', vult:'', obs:'NÃO É MAIS PRIORIDADE'},
-  {emp:'MARCOS LUCIANO', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'29/09/2025', vult:'29/09/2025', obs:''},
-  {emp:'KENNEDY', mun:'TERESINA', uf:'PI', visita:'SIM', periodo:'29/07/2025', v1:'22/09/2025', vult:'22/09/2025', obs:''},
-];
+let NN_DATA = [];
 
 function buildNN(){
   const wrap = document.getElementById('nn-section');
