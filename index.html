@@ -464,7 +464,7 @@ const EMP_NAMES = {
 
 // ── CONTRATOS (planilha separada) ──
 // Contratos e NN: abas da planilha principal
-const CONTRACTS_TAB = "medições";
+const CONTRACTS_TAB = "MEDIÇÕES";
 const NN_TAB = "ACOMPANHAMENTO NN";
 
 function _contractsGvizUrl(){
@@ -596,45 +596,15 @@ async function fetchContractsSheet(){
 }
 
 // ── ACOMPANHAMENTO NN parser ──
-// Expected fields: emp (empreendimento), mun (município), uf, visita (SIM/NÃO),
-// periodo (data da visita), v1 (1ª versão relatório), vult (versão atual), obs.
+// Real layout (col A is empty/blank decorative, data starts col B):
+//   B=EMPREENDIMENTO, C=MUNICIPIO (ex: "RAPOSA/MA" - includes UF),
+//   D=HOUVE VISITA?, E=PERIODO, F=DATA 1º VERSÃO, G=DATA ULTIMA VERSÃO, H=OBSERVAÇÃO
+// Title rows + group header + column header occupy first 4 rows; data starts row 5.
 function parseNNSheet(gviz){
   const rows = gviz.table.rows || [];
-  const cols = gviz.table.cols || [];
 
-  const norm = (s)=>(s||"").toString().toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
-    .replace(/[^a-z0-9]/g,"");
-
-  const synonyms = {
-    emp:     ["empreendimento","emp","nome","denominacao","terreno"],
-    mun:     ["municipio","mun","cidade"],
-    uf:     ["uf","estado"],
-    visita: ["visita","visitado","visitada"],
-    periodo:["periodo","datavisita","dtvisita","datadavisita","data"],
-    v1:     ["v1","1versao","primeiraversao","relatorio1","r1","v01","versao1"],
-    vult:   ["vult","versaoatual","ultversao","ultimaversao","versaoult","atual","relatorioatual"],
-    obs:    ["obs","observacao","observacoes","notas"]
-  };
-
-  // Detect column indices from headers
-  let idxMap = {};
-  cols.forEach((c,i)=>{
-    const label = norm(c.label);
-    if(!label) return;
-    for(const key in synonyms){
-      if(idxMap[key] != null) continue;
-      if(synonyms[key].some(s => label === s || label.includes(s))){
-        idxMap[key] = i;
-        break;
-      }
-    }
-  });
-
-  // Fallback to fixed positions if header detection failed
-  if(Object.keys(idxMap).length < 4){
-    idxMap = {emp:0, mun:1, uf:2, visita:3, periodo:4, v1:5, vult:6, obs:7};
-  }
+  // Fixed column positions matching real sheet layout
+  const idxMap = {emp:1, munuf:2, visita:3, periodo:4, v1:5, vult:6, obs:7};
 
   const out = [];
   rows.forEach(r=>{
@@ -649,12 +619,25 @@ function parseNNSheet(gviz){
     };
     const emp = str("emp");
     if(!emp) return;
-    if(emp.toUpperCase().includes("EMPREENDIMENTO") || emp.toUpperCase().includes("ACOMPANHAMENTO")) return;
+    const upEmp = emp.toUpperCase();
+    // Skip header / title / group rows
+    if(upEmp.includes("EMPREENDIMENTO")) return;
+    if(upEmp.includes("ACOMPANHAMENTO")) return;
+    if(upEmp.includes("NOVOS NEGOCIOS") || upEmp.includes("NOVOS NEGÓCIOS")) return;
+
+    // Split MUNICIPIO/UF (real format: "RAPOSA/MA")
+    const munuf = str("munuf");
+    let mun = munuf, uf = "";
+    if(munuf.includes("/")){
+      const parts = munuf.split("/");
+      mun = parts[0].trim();
+      uf  = (parts[1]||"").trim().toUpperCase();
+    }
 
     out.push({
       emp:     emp,
-      mun:     str("mun"),
-      uf:      str("uf").toUpperCase(),
+      mun:     mun,
+      uf:      uf,
       visita:  str("visita").toUpperCase(),
       periodo: str("periodo"),
       v1:      str("v1"),
@@ -673,7 +656,7 @@ async function fetchNNSheet(){
   return _parseGviz(text);
 }
 
-const CACHE_KEY = "conviver_sheets_cache_v1";
+const CACHE_KEY = "conviver_sheets_cache_v3";
 const CACHE_TTL = 5*60*1000; // 5 minutes
 
 function _gvizUrl(sheetName){
@@ -799,25 +782,60 @@ async function loadFromSheets(forceRefresh){
   }
 
   const newD = {};
+  const errors = [];
+
   for(const key of ["RIV","CTM","EXT","KEN","MLU","JBR","GE"]){
-    const gviz = await fetchSheet(SHEETS_TABS[key]);
-    newD[key] = {name: EMP_NAMES[key], rows: parseEmpSheet(gviz, key==="GE")};
+    try {
+      const gviz = await fetchSheet(SHEETS_TABS[key]);
+      newD[key] = {name: EMP_NAMES[key], rows: parseEmpSheet(gviz, key==="GE")};
+    } catch(e){
+      console.error(`Erro ao carregar aba ${SHEETS_TABS[key]}:`, e);
+      errors.push(`${SHEETS_TABS[key]}: ${e.message}`);
+      newD[key] = {name: EMP_NAMES[key], rows: []};
+    }
   }
-  const dvtGviz = await fetchSheet(SHEETS_TABS.DVT);
-  newD.DVT = parseDVTSheet(dvtGviz);
 
-  // Fetch contracts and NN from same spreadsheet, different tabs
-  const contractsGviz = await fetchContractsSheet();
-  const newContracts = parseContractsSheet(contractsGviz);
+  try {
+    const dvtGviz = await fetchSheet(SHEETS_TABS.DVT);
+    newD.DVT = parseDVTSheet(dvtGviz);
+  } catch(e){
+    console.error("Erro ao carregar DVT:", e);
+    errors.push(`DVT: ${e.message}`);
+    newD.DVT = [];
+  }
 
-  const nnGviz = await fetchNNSheet();
-  const newNN = parseNNSheet(nnGviz);
+  // Fetch contracts (separate try/catch — most likely to fail)
+  let newContracts = [];
+  try {
+    const contractsGviz = await fetchContractsSheet();
+    newContracts = parseContractsSheet(contractsGviz);
+  } catch(e){
+    console.error("Erro ao carregar contratos (MEDIÇÕES):", e);
+    errors.push(`MEDIÇÕES: ${e.message}`);
+  }
+
+  // Fetch NN
+  let newNN = [];
+  try {
+    const nnGviz = await fetchNNSheet();
+    newNN = parseNNSheet(nnGviz);
+  } catch(e){
+    console.error("Erro ao carregar NN:", e);
+    errors.push(`ACOMPANHAMENTO NN: ${e.message}`);
+  }
+
+  // If everything failed, throw a consolidated error so the overlay shows it
+  const totalEmpRows = ["RIV","CTM","EXT","KEN","MLU","JBR","GE"]
+    .reduce((s,k)=>s+(newD[k]?.rows?.length||0),0);
+  if(totalEmpRows === 0 && newContracts.length === 0 && newNN.length === 0){
+    throw new Error("Não foi possível carregar nenhum dado. Verifique se a planilha está compartilhada como 'Qualquer pessoa com o link — Leitor'. Detalhes: " + errors.join(" | "));
+  }
 
   // Save cache
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({ts:Date.now(), data:newD, contracts:newContracts, nn:newNN}));
   } catch(e){}
-  return {data:newD, contracts:newContracts, nn:newNN, fromCache:false, ts:Date.now()};
+  return {data:newD, contracts:newContracts, nn:newNN, fromCache:false, ts:Date.now(), errors:errors};
 }
 
 function showLoadingOverlay(msg){
@@ -861,13 +879,12 @@ async function reloadAllFromSheets(forceRefresh){
   try {
     const result = await loadFromSheets(forceRefresh);
     Object.assign(D, result.data);
-    if(result.contracts){
-      CONTRATOS.length = 0;
-      result.contracts.forEach(c=>CONTRATOS.push(c));
-    }
-    if(result.nn){
-      NN_DATA.length = 0;
-      result.nn.forEach(n=>NN_DATA.push(n));
+    CONTRATOS.length = 0;
+    if(result.contracts) result.contracts.forEach(c=>CONTRATOS.push(c));
+    NN_DATA.length = 0;
+    if(result.nn) result.nn.forEach(n=>NN_DATA.push(n));
+    if(result.errors && result.errors.length){
+      console.warn("Alguns dados não foram carregados:", result.errors);
     }
     // Re-render everything
     buildDash();
